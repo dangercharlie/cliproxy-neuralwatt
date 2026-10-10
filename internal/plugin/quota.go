@@ -44,7 +44,7 @@ func (m *Manager) FetchQuota(ctx context.Context, req pluginapi.QuotaFetchReques
 	if req.HTTPClient != nil {
 		client = req.HTTPClient
 	}
-	q, err := fetchNeuralwattQuota(ctx, client, cfg.BaseURL, key, cfg.Timeout())
+	q, _, err := m.neuralwattQuota(ctx, cfg, client, key, false)
 	if err != nil {
 		return pluginapi.QuotaFetchResponse{}, err
 	}

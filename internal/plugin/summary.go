@@ -201,7 +201,9 @@ func (m *Manager) fetchAccount(ctx context.Context, cfg Config, entry pluginapi.
 	if acct.Label == "" {
 		acct.Label = entry.Name
 	}
-	acct.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	if acct.FetchedAt == "" {
+		acct.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	}
 	return acct
 }
 

@@ -27,7 +27,9 @@ type fakeHost struct {
 	requests  []pluginapi.HTTPRequest
 }
 
-func (f *fakeHost) AuthList(context.Context) ([]pluginapi.HostAuthFileEntry, error) { return f.files, nil }
+func (f *fakeHost) AuthList(context.Context) ([]pluginapi.HostAuthFileEntry, error) {
+	return f.files, nil
+}
 func (f *fakeHost) AuthGet(_ context.Context, idx string) (pluginapi.HostAuthGetResponse, error) {
 	return pluginapi.HostAuthGetResponse{AuthIndex: idx, JSON: json.RawMessage(f.storage[idx])}, nil
 }
@@ -105,6 +107,43 @@ func TestClaudeWindowsUseLimitsArray(t *testing.T) {
 	}
 	if organizationDisplay("seat-two@example.com's Organization") != "Personal" || organizationDisplay("Inreach") != "Inreach" {
 		t.Fatal("organization display")
+	}
+}
+
+func TestNeuralwattCacheServesStaleOn429(t *testing.T) {
+	host := &fakeHost{responses: map[string]pluginapi.HTTPResponse{
+		defaultBaseURL + "/v1/quota": {StatusCode: 200, Body: []byte(neuralwattSample)},
+	}}
+	m := NewManager(host)
+	cfg := m.config()
+	q, _, err := m.neuralwattQuota(context.Background(), cfg, host, "sk-x", false)
+	if err != nil || q.Subscription.Plan != "standard" {
+		t.Fatalf("first fetch: %v %+v", err, q.Subscription)
+	}
+	host.responses[defaultBaseURL+"/v1/quota"] = pluginapi.HTTPResponse{StatusCode: 429}
+	// Within nwMinRefresh even a forced refresh is served from cache.
+	if _, _, err := m.neuralwattQuota(context.Background(), cfg, host, "sk-x", true); err != nil || len(host.requests) != 1 {
+		t.Fatalf("forced refresh hit upstream: err=%v requests=%d", err, len(host.requests))
+	}
+	// Age the entry past the TTL: upstream 429 must fall back to the stale reading.
+	m.nwCache.put(credentialID("sk-x"), q, time.Now().Add(-2*cfg.CacheTTL()))
+	q2, at, err := m.neuralwattQuota(context.Background(), cfg, host, "sk-x", false)
+	if err != nil || q2.Subscription.Plan != "standard" || len(host.requests) != 2 || time.Since(at) < cfg.CacheTTL() {
+		t.Fatalf("stale fallback: err=%v requests=%d at=%v", err, len(host.requests), at)
+	}
+	// Beyond nwStaleMax the error surfaces.
+	m.nwCache.put(credentialID("sk-x"), q, time.Now().Add(-2*nwStaleMax))
+	if _, _, err := m.neuralwattQuota(context.Background(), cfg, host, "sk-x", false); err == nil || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("expected 429 error, got %v", err)
+	}
+}
+
+func TestCodexMonthlyWindow(t *testing.T) {
+	var u codexUsage
+	_ = json.Unmarshal([]byte(`{"plan_type":"free","rate_limit":{"secondary_window":{"used_percent":68,"reset_at":1762420392,"limit_window_seconds":2592000}}}`), &u)
+	w := codexWindows(u)
+	if len(w) != 1 || w[0].Key != "monthly" || w[0].Label != "Monthly" {
+		t.Fatalf("windows = %+v", w)
 	}
 }
 
@@ -208,9 +247,9 @@ func TestSummaryEndpoint(t *testing.T) {
 			"n1": `{"type":"neuralwatt","api_key":"sk-x"}`,
 		},
 		responses: map[string]pluginapi.HTTPResponse{
-			anthropicUsageURL:               {StatusCode: 200, Body: []byte(claudeSample)},
-			codexUsageURL:                   {StatusCode: 200, Body: []byte(codexSample)},
-			defaultBaseURL + "/v1/quota":    {StatusCode: 200, Body: []byte(neuralwattSample)},
+			anthropicUsageURL:            {StatusCode: 200, Body: []byte(claudeSample)},
+			codexUsageURL:                {StatusCode: 200, Body: []byte(codexSample)},
+			defaultBaseURL + "/v1/quota": {StatusCode: 200, Body: []byte(neuralwattSample)},
 		},
 	}
 	m := NewManager(host)

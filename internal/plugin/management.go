@@ -93,11 +93,11 @@ func (m *Manager) rawNeuralwattQuota(ctx context.Context) pluginapi.ManagementRe
 	if key == "" {
 		return jsonResponse(http.StatusNotFound, map[string]string{"error": "no api-key configured"})
 	}
-	q, err := fetchNeuralwattQuota(ctx, m.host, cfg.BaseURL, key, cfg.Timeout())
+	q, at, err := m.neuralwattQuota(ctx, cfg, m.host, key, false)
 	if err != nil {
 		return jsonResponse(http.StatusBadGateway, map[string]string{"error": err.Error()})
 	}
-	return jsonResponse(http.StatusOK, map[string]any{"upstream": q, "quota": neuralwattQuotaResponse(q, time.Now())})
+	return jsonResponse(http.StatusOK, map[string]any{"fetched_at": at.UTC().Format(time.RFC3339), "upstream": q, "quota": neuralwattQuotaResponse(q, time.Now())})
 }
 
 func jsonResponse(status int, body any) pluginapi.ManagementResponse {

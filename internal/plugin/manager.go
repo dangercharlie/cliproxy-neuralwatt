@@ -33,16 +33,17 @@ const (
 
 // Manager dispatches RPC methods from the host.
 type Manager struct {
-	host   HostClient
-	mu     sync.RWMutex
-	cfg    Config
-	lifeMu sync.Mutex
-	cache  *summaryCache
+	host    HostClient
+	mu      sync.RWMutex
+	cfg     Config
+	lifeMu  sync.Mutex
+	cache   *summaryCache
+	nwCache *nwCache
 }
 
 func NewManager(host HostClient) *Manager {
 	cfg, _ := LoadConfig(nil)
-	return &Manager{host: host, cfg: cfg, cache: newSummaryCache()}
+	return &Manager{host: host, cfg: cfg, cache: newSummaryCache(), nwCache: newNWCache()}
 }
 
 func (m *Manager) config() Config {
@@ -184,6 +185,7 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	m.cfg = cfg
 	m.mu.Unlock()
 	m.cache.reset()
+	m.nwCache.reset()
 	if cfg.Enabled && cfg.APIKey != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), lifecycleTimeout)
 		defer cancel()

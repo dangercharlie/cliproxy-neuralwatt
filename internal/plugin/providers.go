@@ -241,9 +241,12 @@ func codexWindows(usage codexUsage) []Window {
 			continue
 		}
 		key, label := "session", "5 hours"
-		if seconds >= 518400 {
+		switch {
+		case seconds >= 25*24*3600:
+			key, label = "monthly", "Monthly"
+		case seconds >= 518400:
 			key, label = "weekly", "Weekly"
-		} else if seconds > 0 && seconds != sessionSeconds {
+		case seconds > 0 && seconds != sessionSeconds:
 			label = fmt.Sprintf("%d hours", seconds/3600)
 		}
 		if seen[key] {
@@ -269,11 +272,12 @@ func (m *Manager) fetchNeuralwattAccount(ctx context.Context, cfg Config, storag
 	if acct.Label == "" {
 		acct.Label = cfg.Label
 	}
-	q, err := fetchNeuralwattQuota(ctx, m.host, cfg.BaseURL, key, cfg.Timeout())
+	q, at, err := m.neuralwattQuota(ctx, cfg, m.host, key, false)
 	if err != nil {
 		return err
 	}
 	now := time.Now()
+	acct.FetchedAt = at.UTC().Format(time.RFC3339)
 	acct.Plan = strings.TrimSpace(strings.Join(nonEmpty(q.Subscription.Plan, q.Subscription.BillingInterval), " · "))
 	if q.Key.Name != "" {
 		acct.Email = q.Key.Name

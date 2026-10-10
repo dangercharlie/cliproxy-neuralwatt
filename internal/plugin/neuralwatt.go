@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -54,6 +55,72 @@ type nwUsageBucket struct {
 	EnergyKWh float64 `json:"energy_kwh"`
 }
 
+// errRateLimited marks an upstream 429; callers fall back to a cached reading.
+var errRateLimited = fmt.Errorf("neuralwatt rate limited the quota request (http 429)")
+
+// nwCache remembers the last good reading per key so CLIProxyBar-style
+// polling (every 15 s) and the summary endpoint share one upstream call and
+// a 429 never blanks the display.
+type nwCache struct {
+	mu      sync.Mutex
+	entries map[string]nwCached
+}
+
+type nwCached struct {
+	quota nwQuota
+	at    time.Time
+}
+
+const (
+	nwMinRefresh = 15 * time.Second // even a forced refresh waits this long
+	nwStaleMax   = 15 * time.Minute // serve a stale reading this long on errors
+)
+
+func newNWCache() *nwCache { return &nwCache{entries: map[string]nwCached{}} }
+
+func (c *nwCache) get(key string) (nwCached, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	return e, ok
+}
+
+func (c *nwCache) put(key string, q nwQuota, at time.Time) {
+	c.mu.Lock()
+	c.entries[key] = nwCached{quota: q, at: at}
+	c.mu.Unlock()
+}
+
+func (c *nwCache) reset() {
+	c.mu.Lock()
+	c.entries = map[string]nwCached{}
+	c.mu.Unlock()
+}
+
+// neuralwattQuota returns a reading for key, from cache when fresh enough,
+// otherwise from upstream; on upstream failure it serves a stale reading up
+// to nwStaleMax old. The returned time is when the reading was taken.
+func (m *Manager) neuralwattQuota(ctx context.Context, cfg Config, client httpDoer, key string, force bool) (nwQuota, time.Time, error) {
+	digest := credentialID(key)
+	now := time.Now()
+	cached, ok := m.nwCache.get(digest)
+	if ok {
+		age := now.Sub(cached.at)
+		if age < nwMinRefresh || (!force && age < cfg.CacheTTL()) {
+			return cached.quota, cached.at, nil
+		}
+	}
+	q, err := fetchNeuralwattQuota(ctx, client, cfg.BaseURL, key, cfg.Timeout())
+	if err != nil {
+		if ok && now.Sub(cached.at) < nwStaleMax {
+			return cached.quota, cached.at, nil
+		}
+		return nwQuota{}, time.Time{}, err
+	}
+	m.nwCache.put(digest, q, now)
+	return q, now, nil
+}
+
 type httpDoer interface {
 	Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)
 }
@@ -84,6 +151,9 @@ func fetchNeuralwattQuota(ctx context.Context, client httpDoer, baseURL, apiKey 
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return out, fmt.Errorf("neuralwatt rejected the api key (http %d)", resp.StatusCode)
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return out, errRateLimited
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return out, fmt.Errorf("neuralwatt quota returned http %d", resp.StatusCode)
