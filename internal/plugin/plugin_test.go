@@ -1,0 +1,252 @@
+package plugin
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+const neuralwattSample = `{"snapshot_at":"2026-10-10T13:04:37Z","balance":{"credits_remaining_usd":60.7167,"total_credits_usd":60.7167,"credits_used_usd":0.0},"usage":{"lifetime":{"cost_usd":210.8215,"requests":49917,"tokens":7169854132,"energy_kwh":43.8986},"current_month":{"cost_usd":8.4705,"requests":2994,"tokens":331007723,"energy_kwh":2.3703}},"limits":{"overage_limit_usd":null,"rate_limit_tier":"standard"},"subscription":{"plan":"standard","status":"active","billing_interval":"year","current_period_start":"2026-07-02T03:15:42Z","current_period_end":"2027-07-02T03:15:42Z","auto_renew":true,"kwh_included":16.0,"kwh_used":2.205,"kwh_remaining":13.795,"in_overage":false,"kwh_reset_date":"2026-10-30T03:41:02Z"},"key":{"name":"quotio-macpro","allowance":null}}`
+
+const claudeSample = `{"five_hour":{"utilization":25.0,"resets_at":"2026-10-10T17:00:00.406136+00:00"},"seven_day":null,"limits":[{"kind":"session","group":"session","percent":25,"severity":"normal","resets_at":"2026-10-10T17:00:00.406136+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":3,"severity":"normal","resets_at":"2026-10-17T15:00:00.406358+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]}`
+
+const codexSample = `{"plan_type":"free","rate_limit":{"primary_window":{"used_percent":12,"reset_at":1760200000,"limit_window_seconds":18000},"secondary_window":{"used_percent":55,"reset_at":1760700000,"limit_window_seconds":604800}},"rate_limit_reset_credits":{"available_count":1}}`
+
+// fakeHost is an in-memory HostClient.
+type fakeHost struct {
+	files     []pluginapi.HostAuthFileEntry
+	storage   map[string]string
+	saved     []pluginapi.HostAuthSaveRequest
+	responses map[string]pluginapi.HTTPResponse
+	requests  []pluginapi.HTTPRequest
+}
+
+func (f *fakeHost) AuthList(context.Context) ([]pluginapi.HostAuthFileEntry, error) { return f.files, nil }
+func (f *fakeHost) AuthGet(_ context.Context, idx string) (pluginapi.HostAuthGetResponse, error) {
+	return pluginapi.HostAuthGetResponse{AuthIndex: idx, JSON: json.RawMessage(f.storage[idx])}, nil
+}
+func (f *fakeHost) AuthSave(_ context.Context, req pluginapi.HostAuthSaveRequest) error {
+	f.saved = append(f.saved, req)
+	return nil
+}
+func (f *fakeHost) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	f.requests = append(f.requests, req)
+	if r, ok := f.responses[req.URL]; ok {
+		return r, nil
+	}
+	return pluginapi.HTTPResponse{StatusCode: 404}, nil
+}
+func (f *fakeHost) Log(string, string, map[string]any) {}
+
+func TestNeuralwattMapping(t *testing.T) {
+	var q nwQuota
+	if err := json.Unmarshal([]byte(neuralwattSample), &q); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
+	resp := neuralwattQuotaResponse(q, now)
+	if resp.Subscription == nil || resp.Subscription.Plan != "standard" {
+		t.Fatalf("plan = %+v", resp.Subscription)
+	}
+	if len(resp.Groups) != 1 || len(resp.Groups[0].Buckets) != 1 {
+		t.Fatalf("groups = %+v", resp.Groups)
+	}
+	b := resp.Groups[0].Buckets[0]
+	if b.RemainingFraction < 0.861 || b.RemainingFraction > 0.863 {
+		t.Fatalf("remainingFraction = %v", b.RemainingFraction)
+	}
+	if b.ResetTime != "2026-10-30T03:41:02Z" {
+		t.Fatalf("resetTime = %q", b.ResetTime)
+	}
+	if b.Description != "2.21 of 16 kWh" && b.Description != "2.2 of 16 kWh" {
+		t.Fatalf("description = %q", b.Description)
+	}
+	var credits, month float64
+	for _, m := range resp.Summary {
+		switch m.Key {
+		case "credits_remaining":
+			credits = m.Value
+			if m.Format != "currency" || m.Currency != "USD" {
+				t.Fatalf("credits metric = %+v", m)
+			}
+		case "month_cost":
+			month = m.Value
+		}
+	}
+	if credits != 60.72 || month != 8.47 {
+		t.Fatalf("credits=%v month=%v", credits, month)
+	}
+	_, seconds, ok := energyWindow(q, now)
+	if !ok || seconds != int64((30*24*time.Hour).Seconds()) {
+		t.Fatalf("energy window seconds = %d ok=%v", seconds, ok)
+	}
+}
+
+func TestClaudeWindowsUseLimitsArray(t *testing.T) {
+	var u claudeUsage
+	if err := json.Unmarshal([]byte(claudeSample), &u); err != nil {
+		t.Fatal(err)
+	}
+	w := claudeWindows(u)
+	if len(w) != 2 {
+		t.Fatalf("windows = %+v", w)
+	}
+	if w[0].Key != "session" || w[0].UsedPercent != 25 || w[0].WindowSeconds != sessionSeconds || w[0].Severity != "normal" {
+		t.Fatalf("session = %+v", w[0])
+	}
+	if w[1].Key != "weekly_fable" || w[1].Label != "Weekly · Fable" || w[1].UsedPercent != 3 || w[1].WindowSeconds != weekSeconds {
+		t.Fatalf("weekly = %+v", w[1])
+	}
+	if organizationDisplay("seat-two@example.com's Organization") != "Personal" || organizationDisplay("Inreach") != "Inreach" {
+		t.Fatal("organization display")
+	}
+}
+
+func TestCodexWindows(t *testing.T) {
+	var u codexUsage
+	if err := json.Unmarshal([]byte(codexSample), &u); err != nil {
+		t.Fatal(err)
+	}
+	w := codexWindows(u)
+	if len(w) != 2 || w[0].Key != "session" || w[1].Key != "weekly" || w[1].UsedPercent != 55 {
+		t.Fatalf("windows = %+v", w)
+	}
+	if w[0].ResetsAt != time.Unix(1760200000, 0).UTC().Format(time.RFC3339) {
+		t.Fatalf("resets_at = %q", w[0].ResetsAt)
+	}
+}
+
+func TestRegisterMaterializesCredentialOnce(t *testing.T) {
+	host := &fakeHost{}
+	m := NewManager(host)
+	req, _ := json.Marshal(map[string]any{"config_yaml": []byte("enabled: true\npriority: 0\napi-key: \"sk-test-123\"\nlabel: \"NW\"\n")})
+	raw, err := m.HandleCall(pluginabi.MethodPluginRegister, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env pluginabi.Envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("register envelope = %s", raw)
+	}
+	var reg struct {
+		SchemaVersion uint32 `json:"schema_version"`
+		Capabilities  map[string]any
+	}
+	if err := json.Unmarshal(env.Result, &reg); err != nil || reg.SchemaVersion != pluginabi.SchemaVersion {
+		t.Fatalf("registration = %s", env.Result)
+	}
+	if reg.Capabilities["quota_provider"] != true || reg.Capabilities["auth_provider"] != true || reg.Capabilities["executor"] != false {
+		t.Fatalf("capabilities = %v", reg.Capabilities)
+	}
+	if len(host.saved) != 1 || !strings.HasPrefix(host.saved[0].Name, "neuralwatt-") || !strings.HasSuffix(host.saved[0].Name, ".json") {
+		t.Fatalf("saved = %+v", host.saved)
+	}
+	var rec credentialRecord
+	if err := json.Unmarshal(host.saved[0].JSON, &rec); err != nil || rec.APIKey != "sk-test-123" || rec.Type != ProviderID || rec.Label != "NW" {
+		t.Fatalf("record = %+v", rec)
+	}
+	// Second register with the credential now listed must not save again.
+	host.files = []pluginapi.HostAuthFileEntry{{ID: rec.ID, Name: host.saved[0].Name, Provider: ProviderID}}
+	if _, err := m.HandleCall(pluginabi.MethodPluginReconfigure, req); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.saved) != 1 {
+		t.Fatalf("credential saved twice: %+v", host.saved)
+	}
+}
+
+func TestAuthParseAndQuotaFetch(t *testing.T) {
+	host := &fakeHost{responses: map[string]pluginapi.HTTPResponse{
+		defaultBaseURL + "/v1/quota": {StatusCode: 200, Body: []byte(neuralwattSample)},
+	}}
+	m := NewManager(host)
+	parseReq, _ := json.Marshal(pluginapi.AuthParseRequest{Provider: "", FileName: "neuralwatt-abc.json", RawJSON: []byte(`{"type":"neuralwatt","id":"neuralwatt-abc","label":"NW","api_key":"sk-x"}`)})
+	raw, _ := m.HandleCall(pluginabi.MethodAuthParse, parseReq)
+	var env pluginabi.Envelope
+	_ = json.Unmarshal(raw, &env)
+	var parsed pluginapi.AuthParseResponse
+	if !env.OK || json.Unmarshal(env.Result, &parsed) != nil || !parsed.Handled || parsed.Auth.Attributes["api_key"] != "sk-x" || parsed.Auth.Provider != ProviderID {
+		t.Fatalf("parse = %s", raw)
+	}
+	// Foreign records are not handled.
+	foreign, _ := json.Marshal(pluginapi.AuthParseRequest{FileName: "claude-x.json", RawJSON: []byte(`{"type":"claude","access_token":"t"}`)})
+	raw, _ = m.HandleCall(pluginabi.MethodAuthParse, foreign)
+	_ = json.Unmarshal(raw, &env)
+	_ = json.Unmarshal(env.Result, &parsed)
+	if !env.OK || parsed.Handled {
+		t.Fatalf("foreign parse = %s", raw)
+	}
+	fetchReq, _ := json.Marshal(pluginapi.QuotaFetchRequest{AuthIndex: "idx", Provider: ProviderID, Attributes: map[string]string{"api_key": "sk-x"}})
+	raw, _ = m.HandleCall(pluginabi.MethodQuotaFetch, fetchReq)
+	_ = json.Unmarshal(raw, &env)
+	var q pluginapi.QuotaFetchResponse
+	if !env.OK || json.Unmarshal(env.Result, &q) != nil || len(q.Groups) != 1 {
+		t.Fatalf("fetch = %s", raw)
+	}
+	if got := host.requests[0].Headers.Get("Authorization"); got != "Bearer sk-x" {
+		t.Fatalf("auth header = %q", got)
+	}
+}
+
+func TestSummaryEndpoint(t *testing.T) {
+	host := &fakeHost{
+		files: []pluginapi.HostAuthFileEntry{
+			{AuthIndex: "c1", Provider: "claude", Label: "seat-one@example.com", Email: "seat-one@example.com"},
+			{AuthIndex: "x1", Provider: "codex", Label: "seat-two@example.com", Email: "seat-two@example.com"},
+			{AuthIndex: "n1", Provider: "neuralwatt", Label: "Neuralwatt"},
+			{AuthIndex: "g1", Provider: "gemini", Label: "ignored"},
+		},
+		storage: map[string]string{
+			"c1": `{"type":"claude","access_token":"tok","email":"seat-one@example.com","organization_name":"Inreach"}`,
+			"x1": `{"type":"codex","access_token":"tok2","account_id":"acc","email":"seat-two@example.com"}`,
+			"n1": `{"type":"neuralwatt","api_key":"sk-x"}`,
+		},
+		responses: map[string]pluginapi.HTTPResponse{
+			anthropicUsageURL:               {StatusCode: 200, Body: []byte(claudeSample)},
+			codexUsageURL:                   {StatusCode: 200, Body: []byte(codexSample)},
+			defaultBaseURL + "/v1/quota":    {StatusCode: 200, Body: []byte(neuralwattSample)},
+		},
+	}
+	m := NewManager(host)
+	req := pluginapi.ManagementRequest{Method: http.MethodGet, Path: managementBase + "/summary"}
+	resp, err := m.HandleManagement(context.Background(), req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("resp = %+v err=%v", resp, err)
+	}
+	var s Summary
+	if err := json.Unmarshal(resp.Body, &s); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Accounts) != 3 {
+		t.Fatalf("accounts = %+v", s.Accounts)
+	}
+	if s.Accounts[0].Provider != "claude" || s.Accounts[0].Label != "Inreach · seat-one@example.com" || len(s.Accounts[0].Windows) != 2 {
+		t.Fatalf("claude = %+v", s.Accounts[0])
+	}
+	if s.Accounts[1].Provider != "codex" || s.Accounts[1].Plan != "free" || len(s.Accounts[1].Windows) != 2 {
+		t.Fatalf("codex = %+v", s.Accounts[1])
+	}
+	if s.Accounts[2].Provider != "neuralwatt" || len(s.Accounts[2].Windows) != 1 || s.Accounts[2].Windows[0].Key != "energy" || len(s.Accounts[2].Metrics) != 4 {
+		t.Fatalf("neuralwatt = %+v", s.Accounts[2])
+	}
+	for _, r := range host.requests {
+		if r.URL == codexUsageURL && r.Headers.Get("ChatGPT-Account-Id") != "acc" {
+			t.Fatalf("codex headers = %v", r.Headers)
+		}
+	}
+	// Cached: a second call makes no new upstream requests.
+	n := len(host.requests)
+	if _, err := m.HandleManagement(context.Background(), req); err != nil || len(host.requests) != n {
+		t.Fatalf("cache miss: %d -> %d", n, len(host.requests))
+	}
+	page, _ := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: resourceBase + "/status"})
+	if page.StatusCode != 200 || !strings.Contains(string(page.Body), "neuralwatt/summary") {
+		t.Fatalf("status page = %d", page.StatusCode)
+	}
+}

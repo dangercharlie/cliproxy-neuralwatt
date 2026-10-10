@@ -1,0 +1,244 @@
+package plugin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+// Window is one usage window (session, weekly, billing period) normalised
+// across providers. Clients derive pace from resets_at and window_seconds.
+type Window struct {
+	Key           string  `json:"key"`
+	Label         string  `json:"label"`
+	UsedPercent   float64 `json:"used_percent"`
+	ResetsAt      string  `json:"resets_at,omitempty"`
+	WindowSeconds int64   `json:"window_seconds,omitempty"`
+	Scope         string  `json:"scope,omitempty"`
+	Severity      string  `json:"severity,omitempty"`
+}
+
+// Account is one credential's quota view.
+type Account struct {
+	Provider     string                  `json:"provider"`
+	AuthIndex    string                  `json:"auth_index"`
+	Label        string                  `json:"label"`
+	Email        string                  `json:"email,omitempty"`
+	Organization string                  `json:"organization,omitempty"`
+	Plan         string                  `json:"plan,omitempty"`
+	Disabled     bool                    `json:"disabled,omitempty"`
+	Unavailable  bool                    `json:"unavailable,omitempty"`
+	Windows      []Window                `json:"windows"`
+	Metrics      []pluginapi.QuotaMetric `json:"metrics"`
+	Error        string                  `json:"error,omitempty"`
+	FetchedAt    string                  `json:"fetched_at,omitempty"`
+}
+
+// Summary is the payload served at GET /v0/management/plugins/neuralwatt/summary.
+type Summary struct {
+	Plugin      string    `json:"plugin"`
+	Version     string    `json:"version"`
+	GeneratedAt string    `json:"generated_at"`
+	Accounts    []Account `json:"accounts"`
+	Error       string    `json:"error,omitempty"`
+}
+
+type summaryCache struct {
+	mu      sync.Mutex
+	entries map[string]cachedAccount
+}
+
+type cachedAccount struct {
+	account Account
+	at      time.Time
+}
+
+func newSummaryCache() *summaryCache { return &summaryCache{entries: map[string]cachedAccount{}} }
+
+func (c *summaryCache) reset() {
+	c.mu.Lock()
+	c.entries = map[string]cachedAccount{}
+	c.mu.Unlock()
+}
+
+func (c *summaryCache) get(key string, ttl time.Duration, now time.Time) (Account, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok || now.Sub(e.at) > ttl {
+		return Account{}, false
+	}
+	return e.account, true
+}
+
+func (c *summaryCache) put(key string, acct Account, now time.Time) {
+	c.mu.Lock()
+	c.entries[key] = cachedAccount{account: acct, at: now}
+	c.mu.Unlock()
+}
+
+var providerOrder = map[string]int{"claude": 0, "codex": 1, ProviderID: 2}
+
+const summaryConcurrency = 4
+
+// buildSummary lists every credential the host knows, fetches usage for the
+// configured providers (cached per credential) and returns them in a stable
+// order. Per-account failures are reported inline, never as a whole failure.
+func (m *Manager) buildSummary(ctx context.Context, force bool) Summary {
+	now := time.Now()
+	out := Summary{Plugin: PluginID, Version: Version, GeneratedAt: now.UTC().Format(time.RFC3339), Accounts: []Account{}}
+	if m.host == nil {
+		out.Error = "host callbacks unavailable"
+		return out
+	}
+	cfg := m.config()
+	entries, err := m.host.AuthList(ctx)
+	if err != nil {
+		out.Error = "listing credentials failed"
+		return out
+	}
+	type slot struct {
+		entry pluginapi.HostAuthFileEntry
+		acct  Account
+	}
+	slots := make([]*slot, 0, len(entries))
+	for _, entry := range entries {
+		provider := strings.ToLower(strings.TrimSpace(entry.Provider))
+		if provider == "" {
+			provider = strings.ToLower(strings.TrimSpace(entry.Type))
+		}
+		if !cfg.summarizes(provider) || strings.TrimSpace(entry.AuthIndex) == "" {
+			continue
+		}
+		entry.Provider = provider
+		slots = append(slots, &slot{entry: entry})
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, summaryConcurrency)
+	for _, s := range slots {
+		if !force {
+			if acct, ok := m.cache.get(s.entry.AuthIndex, cfg.CacheTTL(), now); ok {
+				s.acct = acct
+				continue
+			}
+		}
+		wg.Add(1)
+		go func(s *slot) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			acct := m.fetchAccount(ctx, cfg, s.entry)
+			m.cache.put(s.entry.AuthIndex, acct, time.Now())
+			s.acct = acct
+		}(s)
+	}
+	wg.Wait()
+	for _, s := range slots {
+		out.Accounts = append(out.Accounts, s.acct)
+	}
+	sort.SliceStable(out.Accounts, func(i, j int) bool {
+		a, b := out.Accounts[i], out.Accounts[j]
+		oa, oka := providerOrder[a.Provider]
+		ob, okb := providerOrder[b.Provider]
+		if !oka {
+			oa = 99
+		}
+		if !okb {
+			ob = 99
+		}
+		if oa != ob {
+			return oa < ob
+		}
+		return a.Label < b.Label
+	})
+	return out
+}
+
+func (m *Manager) fetchAccount(ctx context.Context, cfg Config, entry pluginapi.HostAuthFileEntry) Account {
+	acct := Account{
+		Provider:    entry.Provider,
+		AuthIndex:   entry.AuthIndex,
+		Label:       strings.TrimSpace(entry.Label),
+		Email:       strings.TrimSpace(entry.Email),
+		Disabled:    entry.Disabled,
+		Unavailable: entry.Unavailable,
+		Windows:     []Window{},
+		Metrics:     []pluginapi.QuotaMetric{},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			acct.Error = "internal error"
+		}
+	}()
+	storage, err := m.loadStorage(ctx, entry)
+	if err != nil {
+		acct.Error = err.Error()
+		return acct
+	}
+	var fetchErr error
+	switch entry.Provider {
+	case "claude":
+		fetchErr = m.fetchClaude(ctx, cfg, storage, &acct)
+	case "codex":
+		fetchErr = m.fetchCodex(ctx, cfg, storage, &acct)
+	case ProviderID:
+		fetchErr = m.fetchNeuralwattAccount(ctx, cfg, storage, &acct)
+	default:
+		fetchErr = fmt.Errorf("provider %s has no usage source", entry.Provider)
+	}
+	if fetchErr != nil {
+		acct.Error = fetchErr.Error()
+	}
+	if acct.Label == "" {
+		acct.Label = acct.Email
+	}
+	if acct.Label == "" {
+		acct.Label = entry.Name
+	}
+	acct.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	return acct
+}
+
+// loadStorage returns the credential's physical JSON via host.auth.get.
+func (m *Manager) loadStorage(ctx context.Context, entry pluginapi.HostAuthFileEntry) (map[string]any, error) {
+	resp, err := m.host.AuthGet(ctx, entry.AuthIndex)
+	if err != nil {
+		return nil, fmt.Errorf("reading credential failed")
+	}
+	var storage map[string]any
+	if len(resp.JSON) == 0 || json.Unmarshal(resp.JSON, &storage) != nil {
+		return nil, fmt.Errorf("credential storage is not valid JSON")
+	}
+	return storage, nil
+}
+
+func stringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func numberField(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
+}

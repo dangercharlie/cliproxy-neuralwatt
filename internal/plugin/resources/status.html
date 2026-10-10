@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#141311">
+<title>Quota</title>
+<style>
+:root{--surface:#1f1d1b;--page:#141311;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--line:rgba(255,255,255,.08);
+--claude:#cf7f22;--codex:#1a9c82;--nw:#8f84e8;--other:#9a948c;--good:#0ca30c;--warn:#fab219;--bad:#d03b3b}
+*{box-sizing:border-box}html{background:var(--page)}
+body{margin:0;background:var(--page);color:var(--ink);font-family:system-ui,-apple-system,"SF Pro Text",Roboto,sans-serif;-webkit-font-smoothing:antialiased;padding-bottom:env(safe-area-inset-bottom)}
+.top{position:sticky;top:0;z-index:2;display:flex;align-items:baseline;gap:8px;padding:14px 18px 10px;background:rgba(20,19,17,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.top h1{font-size:18px;margin:0}.top .meta{margin-left:auto;color:var(--muted);font-size:12px}
+.top button{border:0;background:rgba(255,255,255,.08);color:var(--ink2);border-radius:8px;padding:6px 10px;font-size:12px}
+.card{margin:12px 14px;border-radius:14px;overflow:hidden;background:var(--surface);border:1px solid rgba(255,255,255,.08)}
+.sec{padding:14px 16px}.sec+.sec{border-top:1px solid var(--line)}
+.sec.claude{background:rgba(207,127,34,.07)}.sec.codex{background:rgba(26,156,130,.07)}.sec.neuralwatt{background:rgba(143,132,232,.09)}
+.hdr{display:flex;align-items:center;gap:7px;font-weight:700;font-size:16px}.hdr .ico{width:18px;text-align:center;font-size:14px}
+.hdr .right{margin-left:auto;font-weight:500;color:var(--muted);font-size:12px;text-align:right}
+.claude .name,.claude .ico{color:var(--claude)}.codex .name,.codex .ico{color:var(--codex)}.neuralwatt .name,.neuralwatt .ico{color:var(--nw)}.other .name,.other .ico{color:var(--other)}
+.acct{color:var(--ink2);font-size:13px;margin:2px 0 8px 25px;word-break:break-all}
+.row{display:grid;grid-template-columns:minmax(64px,auto) 1fr 48px;align-items:center;gap:10px;font-size:14px;color:var(--ink2);margin:9px 0}
+.row .lab{white-space:nowrap}.row .pct{text-align:right;font-weight:700;font-variant-numeric:tabular-nums}
+.claude .pct{color:var(--claude)}.codex .pct{color:var(--codex)}.neuralwatt .pct{color:var(--nw)}.other .pct{color:var(--ink)}
+.track{position:relative;height:10px;border-radius:5px;background:var(--trk)}
+.claude .track{--trk:rgba(207,127,34,.22);--fill:var(--claude)}.codex .track{--trk:rgba(26,156,130,.22);--fill:var(--codex)}.neuralwatt .track{--trk:rgba(143,132,232,.24);--fill:var(--nw)}.other .track{--trk:rgba(154,148,140,.22);--fill:var(--other)}
+.fill{position:absolute;left:0;top:0;bottom:0;border-radius:5px;background:var(--fill)}
+.tick{position:absolute;top:0;bottom:0;width:2px;background:var(--surface);opacity:.9}
+.pace{position:absolute;top:-3px;width:3px;height:16px;border-radius:2px;box-shadow:0 0 0 2px var(--surface)}
+.pace.good{background:var(--good)}.pace.warn{background:var(--warn)}.pace.bad{background:var(--bad)}
+.sub{font-size:12px;color:var(--muted);margin:-4px 0 6px calc(64px + 10px)}
+.hero{display:flex;align-items:baseline;gap:8px;margin:4px 0 2px}.hero b{font-size:32px;font-weight:700;letter-spacing:-.5px;color:var(--ink)}.hero span{color:var(--muted);font-size:13px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.chip{font-size:12px;color:var(--ink2);background:rgba(255,255,255,.06);border-radius:999px;padding:5px 10px}
+.err{color:#e66767;font-size:13px;margin:6px 0 0 25px}.empty{color:var(--muted);padding:40px 20px;text-align:center}
+.dim{opacity:.55}
+</style></head><body>
+<div class="top"><h1>Quota</h1><span class="meta" id="meta">loading…</span><button id="refresh" title="Refresh">↻</button></div>
+<div id="root"><div class="empty">Loading…</div></div>
+<script>
+(function(){
+const SUMMARY='/v0/management/plugins/neuralwatt/summary';
+const KEY_STORE='neuralwatt-mgmt-key';
+const ICON={claude:'✳',codex:'⌬',neuralwatt:'⚡'};
+const NAME={claude:'Claude Code',codex:'Codex',neuralwatt:'Neuralwatt'};
+let lastAt=null, timer=null;
+function managementKey(){
+  try{const raw=localStorage.getItem('cli-proxy-auth');if(raw){const p=JSON.parse(raw);const k=p&&p.state&&p.state.managementKey;if(typeof k==='string'&&k)return k;}}catch(e){}
+  return localStorage.getItem(KEY_STORE)||'';
+}
+function askKey(){const k=prompt('CLIProxyAPI management key');if(k&&k.trim()){localStorage.setItem(KEY_STORE,k.trim());return k.trim();}return '';}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function fmtPct(v){return (Math.round(v))+'%';}
+function fmtIn(ts){if(!ts)return '';const d=new Date(ts)-Date.now();if(isNaN(d))return '';if(d<=0)return 'resetting';const m=Math.round(d/60000);if(m<60)return 'resets in '+m+' min';const h=Math.floor(m/60);if(h<48)return 'resets in '+h+'h '+(m%60)+'m';return 'resets '+new Date(ts).toLocaleDateString(undefined,{day:'numeric',month:'short'});}
+function pace(w){if(!w.resets_at||!w.window_seconds)return null;const reset=new Date(w.resets_at).getTime();const start=reset-w.window_seconds*1000;let e=(Date.now()-start)/(reset-start);if(isNaN(e))return null;e=Math.max(0,Math.min(1,e));return e*100;}
+function bar(cls,w){const p=pace(w);const used=Math.max(0,Math.min(100,w.used_percent||0));let marker='';if(p!==null){let st='good';if(used>p+5)st='warn';if(used>=95)st='bad';marker='<i class="pace '+st+'" style="left:calc('+p.toFixed(1)+'% - 1px)"></i>';}
+  return '<div class="row"><span class="lab">'+esc(w.label)+'</span><div class="track"><div class="fill" style="width:'+used.toFixed(1)+'%"></div><i class="tick" style="left:25%"></i><i class="tick" style="left:50%"></i><i class="tick" style="left:75%"></i>'+marker+'</div><span class="pct">'+fmtPct(used)+'</span></div>'+(w.resets_at?'<div class="sub">'+esc(fmtIn(w.resets_at))+'</div>':'');}
+function metric(mt){if(mt.format==='currency'){return (mt.currency==='USD'?'$':'')+Number(mt.value).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+(mt.currency&&mt.currency!=='USD'?' '+mt.currency:'');}return Number(mt.value).toLocaleString()+(mt.unit?' '+mt.unit:'');}
+function section(a){const cls=['claude','codex','neuralwatt'].includes(a.provider)?a.provider:'other';const name=NAME[a.provider]||a.provider;const right=a.plan?esc(a.plan):'usage';
+  let h='<div class="sec '+cls+(a.disabled?' dim':'')+'"><div class="hdr"><span class="ico">'+(ICON[a.provider]||'•')+'</span><span class="name">'+esc(name)+'</span><span class="right">'+right+'</span></div>';
+  const sub=a.provider==='claude'?a.label:(a.email||a.label);if(sub&&sub!==name)h+='<div class="acct">'+esc(sub)+'</div>';
+  if(a.provider==='neuralwatt'){const kwh=(a.metrics||[]).find(m=>m.key==='kwh_remaining');const en=(a.windows||[]).find(w=>w.key==='energy');if(kwh)h+='<div class="hero"><b>'+Number(kwh.value).toFixed(1)+' kWh</b><span>left'+(en&&en.resets_at?' · '+esc(fmtIn(en.resets_at)):'')+'</span></div>';}
+  for(const w of (a.windows||[]))h+=bar(cls,w);
+  const chips=(a.metrics||[]).filter(m=>m.key!=='kwh_remaining').map(m=>'<span class="chip">'+esc(m.label)+' '+esc(metric(m))+'</span>');if(chips.length)h+='<div class="chips">'+chips.join('')+'</div>';
+  if(a.error)h+='<div class="err">'+esc(a.error)+'</div>';
+  return h+'</div>';}
+function render(d){const root=document.getElementById('root');if(!d.accounts||!d.accounts.length){root.innerHTML='<div class="empty">'+esc(d.error||'No credentials to show')+'</div>';return;}
+  const groups={};for(const a of d.accounts){(groups[a.provider]=groups[a.provider]||[]).push(a);}
+  const order=['neuralwatt','claude','codex'];const keys=Object.keys(groups).sort((x,y)=>(order.indexOf(x)+1||99)-(order.indexOf(y)+1||99));
+  root.innerHTML=keys.map(k=>'<div class="card">'+groups[k].map(section).join('')+'</div>').join('');
+  lastAt=Date.now();tickMeta();}
+function tickMeta(){const m=document.getElementById('meta');if(!lastAt){return;}const s=Math.round((Date.now()-lastAt)/1000);m.textContent='updated '+(s<60?s+' s':Math.round(s/60)+' min')+' ago';}
+async function load(force){const meta=document.getElementById('meta');let key=managementKey();if(!key){key=askKey();if(!key){meta.textContent='no key';return;}}
+  meta.textContent='refreshing…';
+  try{const r=await fetch(SUMMARY+(force?'?refresh=1':''),{headers:{'Authorization':'Bearer '+key},cache:'no-store'});
+    if(r.status===401||r.status===403){localStorage.removeItem(KEY_STORE);meta.textContent='key rejected';document.getElementById('root').innerHTML='<div class="empty">Management key rejected. Tap ↻ to enter it again.</div>';return;}
+    const d=await r.json();render(d);}
+  catch(e){meta.textContent='offline';}
+}
+document.getElementById('refresh').addEventListener('click',()=>load(true));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)load(false);});
+load(false);setInterval(()=>load(false),60000);setInterval(tickMeta,5000);
+})();
+</script></body></html>
