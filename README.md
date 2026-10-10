@@ -17,7 +17,7 @@ executor.
 |---|---|
 | Generic quota contract | `GET /v0/management/quota/providers`, `POST /v0/management/quota/fetch` (`auth_index` of the neuralwatt credential) |
 | All-provider summary | `GET /v0/management/plugins/neuralwatt/summary` (`?refresh=1` bypasses the 45 s cache) |
-| Raw upstream + mapping | `GET /v0/management/plugins/neuralwatt/quota` |
+| Raw upstream + mapping | `GET /v0/management/plugins/neuralwatt/upstream` (the host reserves `/quota` for its own per-plugin fetch, `GET /v0/management/plugins/neuralwatt/quota?auth_index=…`) |
 | Status page | `GET /v0/resource/plugins/neuralwatt/status` (prompts once for the management key, stores it in localStorage) |
 
 Neuralwatt mapping: the included-energy allowance becomes one bucket

@@ -44,7 +44,7 @@ func (m *Manager) registerManagement(_ []byte) ([]byte, error) {
 	}{
 		Routes: []routeSpec{
 			{Method: http.MethodGet, Path: "/plugins/" + PluginID + "/summary"},
-			{Method: http.MethodGet, Path: "/plugins/" + PluginID + "/quota"},
+			{Method: http.MethodGet, Path: "/plugins/" + PluginID + "/upstream"},
 		},
 		Resources: []resourceSpec{
 			{Path: "/status", Menu: "Quota status", Description: "Claude, Codex and Neuralwatt quota in one page (phone friendly)."},
@@ -79,7 +79,7 @@ func (m *Manager) HandleManagement(ctx context.Context, req pluginapi.Management
 	case req.Method == http.MethodGet && path == managementBase+"/summary":
 		force := req.Query != nil && req.Query.Get("refresh") != ""
 		return jsonResponse(http.StatusOK, m.buildSummary(ctx, force)), nil
-	case req.Method == http.MethodGet && path == managementBase+"/quota":
+	case req.Method == http.MethodGet && path == managementBase+"/upstream":
 		return m.rawNeuralwattQuota(ctx), nil
 	}
 	return jsonResponse(http.StatusNotFound, map[string]string{"error": "not found"}), nil
