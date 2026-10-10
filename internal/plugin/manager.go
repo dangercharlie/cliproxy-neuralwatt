@@ -24,7 +24,7 @@ const (
 	PluginID = "neuralwatt"
 	// ProviderID is the auth/quota provider identifier.
 	ProviderID = "neuralwatt"
-	Version    = "0.1.1"
+	Version    = "0.1.2"
 	repoURL    = "https://github.com/dangercharlie/cliproxy-neuralwatt"
 
 	lifecycleTimeout = 10 * time.Second
@@ -39,6 +39,9 @@ type Manager struct {
 	lifeMu  sync.Mutex
 	cache   *summaryCache
 	nwCache *nwCache
+
+	persistMu     sync.Mutex
+	lastPersisted string
 }
 
 func NewManager(host HostClient) *Manager {
@@ -152,6 +155,7 @@ func configFields() []pluginapi.ConfigField {
 		{Name: "base-url", Type: pluginapi.ConfigFieldTypeString, Description: "Neuralwatt API base URL (default https://api.neuralwatt.com)."},
 		{Name: "cache-seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "How long summary results are cached per credential (default 45)."},
 		{Name: "timeout-seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Upstream request timeout (default 15)."},
+		{Name: "cache-file", Type: pluginapi.ConfigFieldTypeString, Description: "Where last good readings are persisted across restarts (default plugins/neuralwatt-cache.json; empty disables)."},
 	}
 }
 
@@ -186,6 +190,7 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	m.mu.Unlock()
 	m.cache.reset()
 	m.nwCache.reset()
+	m.loadPersistedCache(cfg)
 	if cfg.Enabled && cfg.APIKey != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), lifecycleTimeout)
 		defer cancel()

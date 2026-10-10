@@ -15,6 +15,7 @@ const (
 	defaultLabel          = "Neuralwatt"
 	defaultCacheSeconds   = 90
 	defaultTimeoutSeconds = 15
+	defaultCacheFile      = "plugins/neuralwatt-cache.json"
 )
 
 var defaultSummaryProviders = []string{"claude", "codex", ProviderID}
@@ -22,15 +23,19 @@ var defaultSummaryProviders = []string{"claude", "codex", ProviderID}
 // Config is the plugins.configs.neuralwatt block as the host hands it over
 // (YAML, with enabled/priority added by the host).
 type Config struct {
-	Enabled        bool   `yaml:"enabled"`
-	Priority       int    `yaml:"priority"`
-	APIKey         string `yaml:"api-key"`
-	APIKeyEnv      string `yaml:"api-key-env"`
-	APIKeyFile     string `yaml:"api-key-file"`
-	Label          string `yaml:"label"`
-	BaseURL        string `yaml:"base-url"`
-	CacheSeconds   int    `yaml:"cache-seconds"`
-	TimeoutSeconds int    `yaml:"timeout-seconds"`
+	// resolvedCacheFile is CacheFile after defaults ("" disables persistence).
+	resolvedCacheFile string
+
+	Enabled        bool    `yaml:"enabled"`
+	Priority       int     `yaml:"priority"`
+	APIKey         string  `yaml:"api-key"`
+	APIKeyEnv      string  `yaml:"api-key-env"`
+	APIKeyFile     string  `yaml:"api-key-file"`
+	Label          string  `yaml:"label"`
+	BaseURL        string  `yaml:"base-url"`
+	CacheSeconds   int     `yaml:"cache-seconds"`
+	TimeoutSeconds int     `yaml:"timeout-seconds"`
+	CacheFile      *string `yaml:"cache-file"`
 	Summary        struct {
 		Providers []string `yaml:"providers"`
 	} `yaml:"summary"`
@@ -78,6 +83,10 @@ func LoadConfig(raw []byte) (Config, error) {
 	}
 	if cfg.TimeoutSeconds <= 0 {
 		cfg.TimeoutSeconds = defaultTimeoutSeconds
+	}
+	cfg.resolvedCacheFile = defaultCacheFile
+	if cfg.CacheFile != nil {
+		cfg.resolvedCacheFile = strings.TrimSpace(*cfg.CacheFile)
 	}
 	if len(cfg.Summary.Providers) == 0 {
 		cfg.Summary.Providers = append([]string(nil), defaultSummaryProviders...)

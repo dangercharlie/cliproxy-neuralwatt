@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +43,8 @@ type Account struct {
 	// latest attempt failed (StaleReason says why, typically a 429).
 	Stale       bool   `json:"stale,omitempty"`
 	StaleReason string `json:"stale_reason,omitempty"`
+
+	rateLimited bool
 }
 
 // Summary is the payload served at GET /v0/management/plugins/neuralwatt/summary.
@@ -65,12 +68,28 @@ type cachedAccount struct {
 	lastAt time.Time
 	good   *Account
 	goodAt time.Time
+	// backoffUntil blocks upstream fetches after a 429; doubles per failure.
+	backoffUntil time.Time
+	failures     int
 }
 
 const (
 	summaryMinRefresh = 20 * time.Second // even ?refresh=1 waits this long per account
 	summaryStaleMax   = 15 * time.Minute // serve a stale good reading this long
+	backoffInitial    = 2 * time.Minute
+	backoffMax        = 15 * time.Minute
 )
+
+// persistedCache is the on-disk shape: last good reading per credential.
+type persistedCache struct {
+	SavedAt  string                      `json:"saved_at"`
+	Accounts map[string]persistedAccount `json:"accounts"`
+}
+
+type persistedAccount struct {
+	Account Account   `json:"account"`
+	At      time.Time `json:"at"`
+}
 
 func newSummaryCache() *summaryCache { return &summaryCache{entries: map[string]cachedAccount{}} }
 
@@ -80,15 +99,19 @@ func (c *summaryCache) reset() {
 	c.mu.Unlock()
 }
 
-// get returns the last result when it is younger than ttl.
+// get returns the last result when it is younger than ttl, or while the
+// credential is backing off after a rate limit (the stale/err result stands).
 func (c *summaryCache) get(key string, ttl time.Duration, now time.Time) (Account, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[key]
-	if !ok || e.lastAt.IsZero() || now.Sub(e.lastAt) > ttl {
+	if !ok || e.lastAt.IsZero() {
 		return Account{}, false
 	}
-	return e.last, true
+	if now.Before(e.backoffUntil) || now.Sub(e.lastAt) <= ttl {
+		return e.last, true
+	}
+	return Account{}, false
 }
 
 // record stores a fresh result. A failed result is replaced by the last good
@@ -101,14 +124,105 @@ func (c *summaryCache) record(key string, acct Account, now time.Time) Account {
 	if acct.Error == "" {
 		good := acct
 		e.good, e.goodAt = &good, now
-	} else if e.good != nil && now.Sub(e.goodAt) < summaryStaleMax {
-		stale := *e.good
-		stale.Stale, stale.StaleReason = true, acct.Error
-		acct = stale
+		e.failures, e.backoffUntil = 0, time.Time{}
+	} else {
+		if acct.rateLimited {
+			e.failures++
+			wait := backoffInitial << (e.failures - 1)
+			if wait > backoffMax || wait <= 0 {
+				wait = backoffMax
+			}
+			e.backoffUntil = now.Add(wait)
+		}
+		if e.good != nil && now.Sub(e.goodAt) < summaryStaleMax {
+			stale := *e.good
+			stale.Stale, stale.StaleReason = true, acct.Error
+			acct = stale
+		}
 	}
 	e.last, e.lastAt = acct, now
 	c.entries[key] = e
 	return acct
+}
+
+// snapshot returns the good readings for persistence.
+func (c *summaryCache) snapshot() persistedCache {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := persistedCache{SavedAt: time.Now().UTC().Format(time.RFC3339), Accounts: map[string]persistedAccount{}}
+	for key, e := range c.entries {
+		if e.good != nil {
+			out.Accounts[key] = persistedAccount{Account: *e.good, At: e.goodAt}
+		}
+	}
+	return out
+}
+
+// seed installs persisted good readings as stale candidates only; nothing is
+// served from them until a live fetch fails.
+func (c *summaryCache) seed(p persistedCache) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for key, pa := range p.Accounts {
+		if key == "" || pa.At.IsZero() || pa.Account.Error != "" {
+			continue
+		}
+		e := c.entries[key]
+		if e.good == nil || pa.At.After(e.goodAt) {
+			good := pa.Account
+			good.Stale, good.StaleReason = false, ""
+			e.good, e.goodAt = &good, pa.At
+			c.entries[key] = e
+			n++
+		}
+	}
+	return n
+}
+
+func (m *Manager) loadPersistedCache(cfg Config) {
+	if cfg.resolvedCacheFile == "" {
+		return
+	}
+	raw, err := os.ReadFile(cfg.resolvedCacheFile)
+	if err != nil {
+		return
+	}
+	var p persistedCache
+	if json.Unmarshal(raw, &p) != nil {
+		return
+	}
+	if n := m.cache.seed(p); n > 0 {
+		m.log("info", "neuralwatt summary cache restored", map[string]any{"accounts": n})
+	}
+}
+
+func (m *Manager) savePersistedCache(cfg Config) {
+	if cfg.resolvedCacheFile == "" {
+		return
+	}
+	snap := m.cache.snapshot()
+	if len(snap.Accounts) == 0 {
+		return
+	}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return
+	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	if string(raw) == m.lastPersisted {
+		return
+	}
+	tmp := cfg.resolvedCacheFile + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, cfg.resolvedCacheFile); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	m.lastPersisted = string(raw)
 }
 
 var providerOrder = map[string]int{"claude": 0, "codex": 1, ProviderID: 2}
@@ -170,6 +284,7 @@ func (m *Manager) buildSummary(ctx context.Context, force bool) Summary {
 	for _, s := range slots {
 		out.Accounts = append(out.Accounts, s.acct)
 	}
+	m.savePersistedCache(cfg)
 	sort.SliceStable(out.Accounts, func(i, j int) bool {
 		a, b := out.Accounts[i], out.Accounts[j]
 		oa, oka := providerOrder[a.Provider]
@@ -222,6 +337,7 @@ func (m *Manager) fetchAccount(ctx context.Context, cfg Config, entry pluginapi.
 	}
 	if fetchErr != nil {
 		acct.Error = fetchErr.Error()
+		acct.rateLimited = strings.Contains(acct.Error, "429")
 	}
 	if acct.Label == "" {
 		acct.Label = acct.Email

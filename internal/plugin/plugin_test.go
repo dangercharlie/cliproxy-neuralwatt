@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -298,8 +299,50 @@ func TestSummaryEndpoint(t *testing.T) {
 	if !s.Accounts[0].Stale || s.Accounts[0].Error != "" || len(s.Accounts[0].Windows) != 2 || !strings.Contains(s.Accounts[0].StaleReason, "429") {
 		t.Fatalf("stale fallback = %+v", s.Accounts[0])
 	}
+	// While backing off after the 429, a forced refresh makes no upstream call for that account.
+	n = len(host.requests)
+	resp, _ = m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: managementBase + "/summary", Query: map[string][]string{"refresh": {"1"}}})
+	var again Summary
+	_ = json.Unmarshal(resp.Body, &again)
+	if len(host.requests) != n || !again.Accounts[0].Stale {
+		t.Fatalf("backoff not honoured: requests %d -> %d, stale=%v", n, len(host.requests), again.Accounts[0].Stale)
+	}
 	page, _ := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: resourceBase + "/status"})
 	if page.StatusCode != 200 || !strings.Contains(string(page.Body), "neuralwatt/summary") {
 		t.Fatalf("status page = %d", page.StatusCode)
+	}
+}
+
+func TestPersistedCacheSeedsStaleFallback(t *testing.T) {
+	dir := t.TempDir()
+	cacheFile := dir + "/cache.json"
+	host := &fakeHost{
+		files:     []pluginapi.HostAuthFileEntry{{AuthIndex: "c1", Provider: "claude", Label: "x", Email: "seat-one@example.com"}},
+		storage:   map[string]string{"c1": `{"type":"claude","access_token":"tok","email":"seat-one@example.com","organization_name":"Inreach"}`},
+		responses: map[string]pluginapi.HTTPResponse{anthropicUsageURL: {StatusCode: 200, Body: []byte(claudeSample)}},
+	}
+	m := NewManager(host)
+	cfgYAML, _ := json.Marshal(map[string]any{"config_yaml": []byte("enabled: true\ncache-file: \"" + cacheFile + "\"\n")})
+	if _, err := m.HandleCall(pluginabi.MethodPluginRegister, cfgYAML); err != nil {
+		t.Fatal(err)
+	}
+	req := pluginapi.ManagementRequest{Method: http.MethodGet, Path: managementBase + "/summary"}
+	if _, err := m.HandleManagement(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(cacheFile); err != nil {
+		t.Fatalf("cache file not written: %v", err)
+	}
+	// A fresh manager (restart) with upstream now rate-limited serves the persisted reading as stale.
+	host.responses[anthropicUsageURL] = pluginapi.HTTPResponse{StatusCode: 429}
+	m2 := NewManager(host)
+	if _, err := m2.HandleCall(pluginabi.MethodPluginRegister, cfgYAML); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ := m2.HandleManagement(context.Background(), req)
+	var s Summary
+	_ = json.Unmarshal(resp.Body, &s)
+	if len(s.Accounts) != 1 || !s.Accounts[0].Stale || len(s.Accounts[0].Windows) != 2 || s.Accounts[0].Error != "" {
+		t.Fatalf("restart fallback = %+v", s.Accounts)
 	}
 }
