@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "neuralwatt",
+      "name": "Neuralwatt",
+      "description": "Surfaces Neuralwatt quota (included energy, credits, month spend) through CLIProxyAPI's quota API and adds an all-provider summary endpoint and status page.",
+      "author": "dangercharlie",
+      "version": "0.1.0",
+      "repository": "https://github.com/dangercharlie/cliproxy-neuralwatt",
+      "logo": "https://raw.githubusercontent.com/dangercharlie/cliproxy-neuralwatt/main/internal/plugin/resources/logo.svg",
+      "homepage": "https://github.com/dangercharlie/cliproxy-neuralwatt",
+      "license": "MIT",
+      "tags": ["Quota", "Provider", "Monitoring"],
+      "install": { "type": "github-release" }
+    }
+  ]
+}
