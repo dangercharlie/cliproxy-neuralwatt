@@ -24,7 +24,7 @@ const (
 	PluginID = "neuralwatt"
 	// ProviderID is the auth/quota provider identifier.
 	ProviderID = "neuralwatt"
-	Version    = "0.1.0"
+	Version    = "0.1.1"
 	repoURL    = "https://github.com/dangercharlie/cliproxy-neuralwatt"
 
 	lifecycleTimeout = 10 * time.Second

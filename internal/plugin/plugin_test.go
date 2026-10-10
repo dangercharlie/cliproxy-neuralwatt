@@ -284,6 +284,20 @@ func TestSummaryEndpoint(t *testing.T) {
 	if _, err := m.HandleManagement(context.Background(), req); err != nil || len(host.requests) != n {
 		t.Fatalf("cache miss: %d -> %d", n, len(host.requests))
 	}
+	// Upstream 429 after the cache expires: the last good reading is served, flagged stale.
+	host.responses[anthropicUsageURL] = pluginapi.HTTPResponse{StatusCode: 429}
+	m.cache.mu.Lock()
+	for k, e := range m.cache.entries {
+		e.lastAt = e.lastAt.Add(-10 * time.Minute)
+		e.goodAt = e.goodAt.Add(-10 * time.Minute)
+		m.cache.entries[k] = e
+	}
+	m.cache.mu.Unlock()
+	resp, _ = m.HandleManagement(context.Background(), req)
+	_ = json.Unmarshal(resp.Body, &s)
+	if !s.Accounts[0].Stale || s.Accounts[0].Error != "" || len(s.Accounts[0].Windows) != 2 || !strings.Contains(s.Accounts[0].StaleReason, "429") {
+		t.Fatalf("stale fallback = %+v", s.Accounts[0])
+	}
 	page, _ := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: resourceBase + "/status"})
 	if page.StatusCode != 200 || !strings.Contains(string(page.Body), "neuralwatt/summary") {
 		t.Fatalf("status page = %d", page.StatusCode)

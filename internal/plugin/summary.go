@@ -38,6 +38,10 @@ type Account struct {
 	Metrics      []pluginapi.QuotaMetric `json:"metrics"`
 	Error        string                  `json:"error,omitempty"`
 	FetchedAt    string                  `json:"fetched_at,omitempty"`
+	// Stale marks a reading served from the last good fetch because the
+	// latest attempt failed (StaleReason says why, typically a 429).
+	Stale       bool   `json:"stale,omitempty"`
+	StaleReason string `json:"stale_reason,omitempty"`
 }
 
 // Summary is the payload served at GET /v0/management/plugins/neuralwatt/summary.
@@ -54,10 +58,19 @@ type summaryCache struct {
 	entries map[string]cachedAccount
 }
 
+// cachedAccount keeps the last result (served while fresh) and the last good
+// result (served, flagged stale, when a newer attempt fails).
 type cachedAccount struct {
-	account Account
-	at      time.Time
+	last   Account
+	lastAt time.Time
+	good   *Account
+	goodAt time.Time
 }
+
+const (
+	summaryMinRefresh = 20 * time.Second // even ?refresh=1 waits this long per account
+	summaryStaleMax   = 15 * time.Minute // serve a stale good reading this long
+)
 
 func newSummaryCache() *summaryCache { return &summaryCache{entries: map[string]cachedAccount{}} }
 
@@ -67,20 +80,35 @@ func (c *summaryCache) reset() {
 	c.mu.Unlock()
 }
 
+// get returns the last result when it is younger than ttl.
 func (c *summaryCache) get(key string, ttl time.Duration, now time.Time) (Account, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[key]
-	if !ok || now.Sub(e.at) > ttl {
+	if !ok || e.lastAt.IsZero() || now.Sub(e.lastAt) > ttl {
 		return Account{}, false
 	}
-	return e.account, true
+	return e.last, true
 }
 
-func (c *summaryCache) put(key string, acct Account, now time.Time) {
+// record stores a fresh result. A failed result is replaced by the last good
+// one (flagged stale) when that is recent enough, so a rate-limited upstream
+// never blanks a display that was fine a minute ago.
+func (c *summaryCache) record(key string, acct Account, now time.Time) Account {
 	c.mu.Lock()
-	c.entries[key] = cachedAccount{account: acct, at: now}
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	e := c.entries[key]
+	if acct.Error == "" {
+		good := acct
+		e.good, e.goodAt = &good, now
+	} else if e.good != nil && now.Sub(e.goodAt) < summaryStaleMax {
+		stale := *e.good
+		stale.Stale, stale.StaleReason = true, acct.Error
+		acct = stale
+	}
+	e.last, e.lastAt = acct, now
+	c.entries[key] = e
+	return acct
 }
 
 var providerOrder = map[string]int{"claude": 0, "codex": 1, ProviderID: 2}
@@ -122,20 +150,20 @@ func (m *Manager) buildSummary(ctx context.Context, force bool) Summary {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, summaryConcurrency)
 	for _, s := range slots {
-		if !force {
-			if acct, ok := m.cache.get(s.entry.AuthIndex, cfg.CacheTTL(), now); ok {
-				s.acct = acct
-				continue
-			}
+		ttl := cfg.CacheTTL()
+		if force {
+			ttl = summaryMinRefresh
+		}
+		if acct, ok := m.cache.get(s.entry.AuthIndex, ttl, now); ok {
+			s.acct = acct
+			continue
 		}
 		wg.Add(1)
 		go func(s *slot) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			acct := m.fetchAccount(ctx, cfg, s.entry)
-			m.cache.put(s.entry.AuthIndex, acct, time.Now())
-			s.acct = acct
+			s.acct = m.cache.record(s.entry.AuthIndex, m.fetchAccount(ctx, cfg, s.entry), time.Now())
 		}(s)
 	}
 	wg.Wait()

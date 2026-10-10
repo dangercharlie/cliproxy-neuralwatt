@@ -13,7 +13,7 @@ import (
 const (
 	defaultBaseURL        = "https://api.neuralwatt.com"
 	defaultLabel          = "Neuralwatt"
-	defaultCacheSeconds   = 45
+	defaultCacheSeconds   = 90
 	defaultTimeoutSeconds = 15
 )
 
