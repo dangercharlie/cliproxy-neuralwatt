@@ -16,10 +16,10 @@ executor.
 | Surface | Path |
 |---|---|
 | Generic quota contract | `GET /v0/management/quota/providers`, `POST /v0/management/quota/fetch` (`auth_index` of the neuralwatt credential) |
-| All-provider summary | `GET /v0/management/plugins/neuralwatt/summary` (`?refresh=1` shortens the 90 s cache to 20 s; a failed refresh serves the last good reading flagged `stale` for up to 15 min, a 429 backs that credential off for 2 to 15 min, and good readings persist to `cache-file` across restarts) |
+| All-provider summary | `GET /v0/management/plugins/neuralwatt/summary` (`?refresh=1` shortens the 90 s cache to 20 s; a failed refresh serves the last good reading flagged `stale` for up to 15 min, a 429 backs that credential off for 2 to 15 min, and good readings persist to `cache-file` across restarts; concurrent requests for an expired account share one upstream fetch) |
 | Limit resets | Each summary account carries `limit_resets` (`available`, `expires_at`, `eligible`, `reason`): Claude's promotional limit resets (`/limit-reset`) and Codex's reset credits. Anthropic only returns that block to Claude Code, so the Claude usage fetch presents Claude Code's User-Agent and asks for `cedar_ember=1` |
 | Raw upstream + mapping | `GET /v0/management/plugins/neuralwatt/upstream` (the host reserves `/quota` for its own per-plugin fetch, `GET /v0/management/plugins/neuralwatt/quota?auth_index=…`) |
-| Status page | `GET /v0/resource/plugins/neuralwatt/status` (prompts once for the management key, stores it in localStorage) |
+| Status page | `GET /v0/resource/plugins/neuralwatt/status` (prompts once for the management key, stores it in localStorage; its CSP allows only the page's own script and same-origin requests, and forbids framing) |
 | Read-only summary | `GET /v0/resource/plugins/neuralwatt/quota.json`: the summary without the management key, for home-screen widgets. Off unless `summary.public: true`; never forces a refresh (`?refresh` is ignored). Resources skip the management middleware, so keep the proxy off the public internet when enabling it |
 
 The credential the plugin saves is for quota only and declares no models.

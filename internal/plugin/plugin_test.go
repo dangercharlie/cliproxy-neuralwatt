@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -403,5 +404,88 @@ func TestClaudeLimitResets(t *testing.T) {
 	}
 	if limitResets(nil) != nil {
 		t.Fatal("absent block must stay nil")
+	}
+}
+
+// gatedHost holds Anthropic usage calls open until released, so concurrent
+// summaries overlap with the fetch in progress.
+type gatedHost struct {
+	*fakeHost
+	mu      sync.Mutex
+	started chan struct{}
+	gate    chan struct{}
+	claude  int
+}
+
+func (g *gatedHost) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	g.mu.Lock()
+	g.fakeHost.requests = append(g.fakeHost.requests, req)
+	isClaude := strings.HasPrefix(req.URL, anthropicUsageURL)
+	if isClaude {
+		g.claude++
+	}
+	g.mu.Unlock()
+	if isClaude {
+		select {
+		case g.started <- struct{}{}:
+		default:
+		}
+		<-g.gate
+	}
+	if r, ok := g.fakeHost.responses[req.URL]; ok {
+		return r, nil
+	}
+	return pluginapi.HTTPResponse{StatusCode: 404}, nil
+}
+
+func TestConcurrentSummariesShareOneFetch(t *testing.T) {
+	host := &gatedHost{
+		fakeHost: &fakeHost{
+			files:     []pluginapi.HostAuthFileEntry{{AuthIndex: "c1", Provider: "claude", Label: "x", Email: "seat-one@example.com"}},
+			storage:   map[string]string{"c1": `{"type":"claude","access_token":"tok","email":"seat-one@example.com"}`},
+			responses: map[string]pluginapi.HTTPResponse{anthropicUsageURL + anthropicResetQuery: {StatusCode: 200, Body: []byte(claudeSample)}},
+		},
+		started: make(chan struct{}, 1),
+		gate:    make(chan struct{}),
+	}
+	m := NewManager(host)
+	var wg sync.WaitGroup
+	results := make([]Summary, 5)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = m.buildSummary(context.Background(), false)
+		}(i)
+		if i == 0 {
+			<-host.started // the first fetch is in flight before the rest arrive
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(host.gate)
+	wg.Wait()
+	if host.claude != 1 {
+		t.Fatalf("anthropic usage calls = %d, want 1", host.claude)
+	}
+	for i, s := range results {
+		if len(s.Accounts) != 1 || s.Accounts[0].Error != "" || len(s.Accounts[0].Windows) == 0 {
+			t.Fatalf("summary %d = %+v", i, s.Accounts)
+		}
+	}
+}
+
+func TestStatusPageSecurityHeaders(t *testing.T) {
+	if strings.Count(statusPage, "<script") != 1 {
+		t.Fatalf("status page must keep exactly one inline script so its CSP hash covers it")
+	}
+	page, _ := NewManager(&fakeHost{}).HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: resourceBase + "/status"})
+	csp := page.Headers.Get("Content-Security-Policy")
+	for _, want := range []string{"script-src 'sha256-", "connect-src 'self'", "frame-ancestors 'none'", "default-src 'none'"} {
+		if !strings.Contains(csp, want) {
+			t.Fatalf("CSP %q lacks %q", csp, want)
+		}
+	}
+	if page.Headers.Get("X-Frame-Options") != "DENY" || page.Headers.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("headers = %v", page.Headers)
 	}
 }

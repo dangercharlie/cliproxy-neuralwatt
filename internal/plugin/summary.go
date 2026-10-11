@@ -68,8 +68,16 @@ type Summary struct {
 }
 
 type summaryCache struct {
-	mu      sync.Mutex
-	entries map[string]cachedAccount
+	mu       sync.Mutex
+	entries  map[string]cachedAccount
+	inflight map[string]*flight
+}
+
+// flight is one upstream fetch in progress; concurrent summaries for the same
+// credential wait for it instead of calling upstream again.
+type flight struct {
+	done chan struct{}
+	acct Account
 }
 
 // cachedAccount keeps the last result (served while fresh) and the last good
@@ -102,7 +110,32 @@ type persistedAccount struct {
 	At      time.Time `json:"at"`
 }
 
-func newSummaryCache() *summaryCache { return &summaryCache{entries: map[string]cachedAccount{}} }
+func newSummaryCache() *summaryCache {
+	return &summaryCache{entries: map[string]cachedAccount{}, inflight: map[string]*flight{}}
+}
+
+// once runs fetch for key, or waits for the fetch already running for it.
+// Without this, every request arriving while an expired entry refreshes
+// would make its own upstream call (quota.json needs no key to trigger it).
+func (c *summaryCache) once(key string, fetch func() Account) Account {
+	c.mu.Lock()
+	if f, ok := c.inflight[key]; ok {
+		c.mu.Unlock()
+		<-f.done
+		return f.acct
+	}
+	f := &flight{done: make(chan struct{})}
+	c.inflight[key] = f
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.inflight, key)
+		c.mu.Unlock()
+		close(f.done)
+	}()
+	f.acct = fetch()
+	return f.acct
+}
 
 func (c *summaryCache) reset() {
 	c.mu.Lock()
@@ -288,7 +321,9 @@ func (m *Manager) buildSummary(ctx context.Context, force bool) Summary {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			s.acct = m.cache.record(s.entry.AuthIndex, m.fetchAccount(ctx, cfg, s.entry), time.Now())
+			s.acct = m.cache.once(s.entry.AuthIndex, func() Account {
+				return m.cache.record(s.entry.AuthIndex, m.fetchAccount(ctx, cfg, s.entry), time.Now())
+			})
 		}(s)
 	}
 	wg.Wait()

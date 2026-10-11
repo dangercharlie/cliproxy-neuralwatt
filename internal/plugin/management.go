@@ -2,7 +2,9 @@ package plugin
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -116,10 +118,34 @@ func jsonResponse(status int, body any) pluginapi.ManagementResponse {
 	}
 }
 
+// statusCSP lets the page run only its own inline script (by hash), talk only
+// to this origin, and refuses framing. The page reads the management key, so a
+// script that slipped in could not send it elsewhere.
+var statusCSP = func() string {
+	script := statusPage
+	if i := strings.Index(script, "<script>"); i >= 0 {
+		script = script[i+len("<script>"):]
+	}
+	if i := strings.Index(script, "</script>"); i >= 0 {
+		script = script[:i]
+	}
+	sum := sha256.Sum256([]byte(script))
+	return "default-src 'none'; script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'; " +
+		"style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; " +
+		"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+}()
+
 func htmlResponse(page string) pluginapi.ManagementResponse {
 	return pluginapi.ManagementResponse{
 		StatusCode: http.StatusOK,
-		Headers:    http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}},
-		Body:       []byte(page),
+		Headers: http.Header{
+			"Content-Type":            {"text/html; charset=utf-8"},
+			"Cache-Control":           {"no-store"},
+			"Content-Security-Policy": {statusCSP},
+			"X-Frame-Options":         {"DENY"},
+			"X-Content-Type-Options":  {"nosniff"},
+			"Referrer-Policy":         {"no-referrer"},
+		},
+		Body: []byte(page),
 	}
 }
