@@ -49,6 +49,7 @@ func (m *Manager) registerManagement(_ []byte) ([]byte, error) {
 		Resources: []resourceSpec{
 			{Path: "/status", Menu: "Quota status", Description: "Claude, Codex and Neuralwatt quota in one page (phone friendly)."},
 			{Path: "/logo.svg"},
+			{Path: "/quota.json", Description: "Read-only summary without the management key (summary.public)."},
 		},
 	}), nil
 }
@@ -76,6 +77,12 @@ func (m *Manager) HandleManagement(ctx context.Context, req pluginapi.Management
 		return htmlResponse(statusPage), nil
 	case req.Method == http.MethodGet && path == resourceBase+"/logo.svg":
 		return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": {"image/svg+xml"}, "Cache-Control": {"public, max-age=86400"}}, Body: []byte(logoSVG)}, nil
+	case req.Method == http.MethodGet && path == resourceBase+"/quota.json":
+		// Key-free, so it never forces a refresh: callers get the cached reading.
+		if !m.config().Summary.Public {
+			return jsonResponse(http.StatusNotFound, map[string]string{"error": "not found"}), nil
+		}
+		return jsonResponse(http.StatusOK, m.buildSummary(ctx, false)), nil
 	case req.Method == http.MethodGet && path == managementBase+"/summary":
 		force := req.Query != nil && req.Query.Get("refresh") != ""
 		return jsonResponse(http.StatusOK, m.buildSummary(ctx, force)), nil

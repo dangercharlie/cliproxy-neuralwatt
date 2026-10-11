@@ -24,7 +24,7 @@ const (
 	PluginID = "neuralwatt"
 	// ProviderID is the auth/quota provider identifier.
 	ProviderID = "neuralwatt"
-	Version    = "0.1.3"
+	Version    = "0.1.4"
 	repoURL    = "https://github.com/dangercharlie/cliproxy-neuralwatt"
 
 	lifecycleTimeout = 10 * time.Second
@@ -120,6 +120,13 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 	case pluginabi.MethodQuotaReset:
 		return ErrEnvelope("unsupported", "neuralwatt quota cannot be reset"), nil
 
+	// The credential exists for quota only. Without a model answer the host
+	// matches provider "neuralwatt" to an openai-compatibility entry of the
+	// same name and routes requests to it, which fail for want of a base URL.
+	// An empty list keeps it out of routing; the entry's own keys are separate.
+	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
+		return okEnvelope(pluginapi.ModelResponse{Provider: ProviderID}), nil
+
 	case pluginabi.MethodManagementRegister:
 		return m.registerManagement(request)
 	case pluginabi.MethodManagementHandle:
@@ -138,6 +145,7 @@ type capabilities struct {
 	Executor      bool `json:"executor"`
 	QuotaProvider bool `json:"quota_provider"`
 	ManagementAPI bool `json:"management_api"`
+	ModelProvider bool `json:"model_provider"`
 }
 
 type registrationResult struct {
@@ -170,7 +178,7 @@ func registrationEnvelope() []byte {
 			Logo:             resourceBase + "/logo.svg",
 			ConfigFields:     configFields(),
 		},
-		Capabilities: capabilities{AuthProvider: true, Executor: false, QuotaProvider: true, ManagementAPI: true},
+		Capabilities: capabilities{AuthProvider: true, Executor: false, QuotaProvider: true, ManagementAPI: true, ModelProvider: true},
 	})
 }
 

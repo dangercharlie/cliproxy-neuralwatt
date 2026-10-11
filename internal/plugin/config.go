@@ -38,6 +38,9 @@ type Config struct {
 	CacheFile      *string `yaml:"cache-file"`
 	Summary        struct {
 		Providers []string `yaml:"providers"`
+		// Public serves the summary at the key-free quota.json resource, for
+		// home-screen widgets. Off by default: the summary names accounts.
+		Public bool `yaml:"public"`
 	} `yaml:"summary"`
 }
 

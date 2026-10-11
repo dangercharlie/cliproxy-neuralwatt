@@ -181,8 +181,17 @@ func TestRegisterMaterializesCredentialOnce(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &reg); err != nil || reg.SchemaVersion != pluginabi.SchemaVersion {
 		t.Fatalf("registration = %s", env.Result)
 	}
-	if reg.Capabilities["quota_provider"] != true || reg.Capabilities["auth_provider"] != true || reg.Capabilities["executor"] != false {
+	if reg.Capabilities["quota_provider"] != true || reg.Capabilities["auth_provider"] != true || reg.Capabilities["executor"] != false || reg.Capabilities["model_provider"] != true {
 		t.Fatalf("capabilities = %v", reg.Capabilities)
+	}
+	// The quota credential serves no models, statically or per auth, so the host never routes requests to it.
+	for _, method := range []string{pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth} {
+		raw, _ := m.HandleCall(method, []byte(`{"AuthProvider":"neuralwatt"}`))
+		var menv pluginabi.Envelope
+		var models pluginapi.ModelResponse
+		if json.Unmarshal(raw, &menv) != nil || !menv.OK || json.Unmarshal(menv.Result, &models) != nil || models.Provider != ProviderID || len(models.Models) != 0 {
+			t.Fatalf("%s = %s", method, raw)
+		}
 	}
 	if len(host.saved) != 1 || !strings.HasPrefix(host.saved[0].Name, "neuralwatt-") || !strings.HasSuffix(host.saved[0].Name, ".json") {
 		t.Fatalf("saved = %+v", host.saved)
@@ -306,6 +315,27 @@ func TestSummaryEndpoint(t *testing.T) {
 	_ = json.Unmarshal(resp.Body, &again)
 	if len(host.requests) != n || !again.Accounts[0].Stale {
 		t.Fatalf("backoff not honoured: requests %d -> %d, stale=%v", n, len(host.requests), again.Accounts[0].Stale)
+	}
+	// The key-free resource is off by default, and when on never forces a refresh.
+	pub := pluginapi.ManagementRequest{Method: http.MethodGet, Path: resourceBase + "/quota.json", Query: map[string][]string{"refresh": {"1"}}}
+	if off, _ := m.HandleManagement(context.Background(), pub); off.StatusCode != http.StatusNotFound {
+		t.Fatalf("quota.json without summary.public = %d", off.StatusCode)
+	}
+	m.mu.Lock()
+	m.cfg.Summary.Public = true
+	m.mu.Unlock()
+	// Past the 20 s forced-refresh floor but inside the cache TTL: ?refresh=1 would refetch here.
+	m.cache.mu.Lock()
+	for k, e := range m.cache.entries {
+		e.lastAt = e.lastAt.Add(-30 * time.Second)
+		m.cache.entries[k] = e
+	}
+	m.cache.mu.Unlock()
+	n = len(host.requests)
+	on, _ := m.HandleManagement(context.Background(), pub)
+	var public Summary
+	if on.StatusCode != 200 || json.Unmarshal(on.Body, &public) != nil || len(public.Accounts) != 3 || len(host.requests) != n {
+		t.Fatalf("quota.json = %d, %d accounts, requests %d -> %d", on.StatusCode, len(public.Accounts), n, len(host.requests))
 	}
 	page, _ := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: resourceBase + "/status"})
 	if page.StatusCode != 200 || !strings.Contains(string(page.Body), "neuralwatt/summary") {

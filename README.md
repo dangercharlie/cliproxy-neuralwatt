@@ -20,6 +20,13 @@ executor.
 | Limit resets | Each summary account carries `limit_resets` (`available`, `expires_at`, `eligible`, `reason`): Claude's promotional limit resets (`/limit-reset`) and Codex's reset credits. Anthropic only returns that block to Claude Code, so the Claude usage fetch presents Claude Code's User-Agent and asks for `cedar_ember=1` |
 | Raw upstream + mapping | `GET /v0/management/plugins/neuralwatt/upstream` (the host reserves `/quota` for its own per-plugin fetch, `GET /v0/management/plugins/neuralwatt/quota?auth_index=…`) |
 | Status page | `GET /v0/resource/plugins/neuralwatt/status` (prompts once for the management key, stores it in localStorage) |
+| Read-only summary | `GET /v0/resource/plugins/neuralwatt/quota.json`: the summary without the management key, for home-screen widgets. Off unless `summary.public: true`; never forces a refresh (`?refresh` is ignored). Resources skip the management middleware, so keep the proxy off the public internet when enabling it |
+
+The credential the plugin saves is for quota only and declares no models.
+Without that, CLIProxyAPI matches its provider id `neuralwatt` to an
+`openai-compatibility` entry named "Neuralwatt" and routes requests to it,
+which fail with `missing provider baseURL` before falling back to the entry's
+own keys.
 
 Neuralwatt mapping: the included-energy allowance becomes one bucket
 (`remainingFraction`, reset at `kwh_reset_date`); credits remaining, month
@@ -49,6 +56,7 @@ plugins:
       # cache-file: "plugins/neuralwatt-cache.json"   # last good readings, survives restarts; "" disables
       # summary:
       #   providers: [claude, codex, neuralwatt]
+      #   public: false        # true serves resource quota.json without the key
 ```
 
 4. Restart CLIProxyAPI. On start the plugin saves a `neuralwatt-<digest>.json`
