@@ -39,12 +39,23 @@ type Account struct {
 	Metrics      []pluginapi.QuotaMetric `json:"metrics"`
 	Error        string                  `json:"error,omitempty"`
 	FetchedAt    string                  `json:"fetched_at,omitempty"`
+	// LimitResets reports promotional limit resets (Claude) or reset credits
+	// (Codex) the account can still use; nil when the provider said nothing.
+	LimitResets *LimitResets `json:"limit_resets,omitempty"`
 	// Stale marks a reading served from the last good fetch because the
 	// latest attempt failed (StaleReason says why, typically a 429).
 	Stale       bool   `json:"stale,omitempty"`
 	StaleReason string `json:"stale_reason,omitempty"`
 
 	rateLimited bool
+}
+
+// LimitResets is one account's usable limit resets.
+type LimitResets struct {
+	Available int    `json:"available"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	Eligible  bool   `json:"eligible"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // Summary is the payload served at GET /v0/management/plugins/neuralwatt/summary.

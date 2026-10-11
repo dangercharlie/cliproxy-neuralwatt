@@ -13,9 +13,15 @@ import (
 
 const (
 	anthropicUsageURL = "https://api.anthropic.com/api/oauth/usage"
-	codexUsageURL     = "https://chatgpt.com/backend-api/wham/usage"
-	sessionSeconds    = 5 * 60 * 60
-	weekSeconds       = 7 * 24 * 60 * 60
+	// Anthropic only includes the promotional limit-reset block (what Claude
+	// Code's /limit-reset reads) when the caller looks like Claude Code: the
+	// cedar_ember query flag plus its User-Agent and x-app. Other callers get
+	// null. Same approach as cswap's usage.resetGrants.
+	anthropicResetQuery = "?cedar_ember=1"
+	claudeCodeUserAgent = "claude-cli/2.1.296 (external, cli)"
+	codexUsageURL       = "https://chatgpt.com/backend-api/wham/usage"
+	sessionSeconds      = 5 * 60 * 60
+	weekSeconds         = 7 * 24 * 60 * 60
 )
 
 func (m *Manager) getJSON(ctx context.Context, cfg Config, url string, headers http.Header, what string) ([]byte, error) {
@@ -69,6 +75,42 @@ type claudeUsage struct {
 	SevenDayOpus   *claudeWindow `json:"seven_day_opus"`
 	SevenDaySonnet *claudeWindow `json:"seven_day_sonnet"`
 	Limits         []claudeLimit `json:"limits"`
+	CedarEmber     *claudeResets `json:"cedar_ember"`
+}
+
+// claudeResets is the promotional limit-reset block.
+type claudeResets struct {
+	Eligible         bool               `json:"eligible"`
+	IneligibleReason string             `json:"ineligible_reason"`
+	Grants           []claudeResetGrant `json:"grants"`
+}
+
+type claudeResetGrant struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	ResetsTotal *int   `json:"resets_total"`
+	ResetsLeft  *int   `json:"resets_left"`
+	StartsAt    string `json:"starts_at"`
+	EndsAt      string `json:"ends_at"`
+}
+
+// limitResets folds the grants into one display fact: how many resets the
+// account can still use and when the soonest-ending usable grant expires.
+func limitResets(r *claudeResets) *LimitResets {
+	if r == nil {
+		return nil
+	}
+	out := &LimitResets{Eligible: r.Eligible, Reason: strings.TrimSpace(r.IneligibleReason)}
+	for _, g := range r.Grants {
+		if g.ResetsLeft == nil || *g.ResetsLeft <= 0 {
+			continue
+		}
+		out.Available += *g.ResetsLeft
+		if g.EndsAt != "" && (out.ExpiresAt == "" || g.EndsAt < out.ExpiresAt) {
+			out.ExpiresAt = g.EndsAt
+		}
+	}
+	return out
 }
 
 func (m *Manager) fetchClaude(ctx context.Context, cfg Config, storage map[string]any, acct *Account) error {
@@ -81,9 +123,11 @@ func (m *Manager) fetchClaude(ctx context.Context, cfg Config, storage map[strin
 	}
 	acct.Organization = organizationDisplay(stringField(storage, "organization_name"))
 	acct.Label = claudeLabel(acct.Organization, acct.Email)
-	body, err := m.getJSON(ctx, cfg, anthropicUsageURL, http.Header{
+	body, err := m.getJSON(ctx, cfg, anthropicUsageURL+anthropicResetQuery, http.Header{
 		"Authorization":  {"Bearer " + token},
 		"anthropic-beta": {"oauth-2025-04-20"},
+		"User-Agent":     {claudeCodeUserAgent},
+		"x-app":          {"cli"},
 	}, "anthropic usage")
 	if err != nil {
 		return err
@@ -93,6 +137,7 @@ func (m *Manager) fetchClaude(ctx context.Context, cfg Config, storage map[strin
 		return fmt.Errorf("anthropic usage response is not valid JSON")
 	}
 	acct.Windows = claudeWindows(usage)
+	acct.LimitResets = limitResets(usage.CedarEmber)
 	if len(acct.Windows) == 0 {
 		return fmt.Errorf("anthropic usage response carried no limits")
 	}
@@ -219,6 +264,8 @@ func (m *Manager) fetchCodex(ctx context.Context, cfg Config, storage map[string
 	acct.Windows = codexWindows(usage)
 	if usage.ResetCredits.AvailableCount != nil {
 		acct.Metrics = append(acct.Metrics, pluginapi.QuotaMetric{Key: "reset_credits", Label: "Reset credits", Value: *usage.ResetCredits.AvailableCount, Unit: "credits"})
+		// Codex reports a count only; no eligibility or expiry.
+		acct.LimitResets = &LimitResets{Eligible: true, Available: int(*usage.ResetCredits.AvailableCount)}
 	}
 	if len(acct.Windows) == 0 {
 		return fmt.Errorf("codex usage response carried no rate limits")

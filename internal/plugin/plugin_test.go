@@ -248,9 +248,9 @@ func TestSummaryEndpoint(t *testing.T) {
 			"n1": `{"type":"neuralwatt","api_key":"sk-x"}`,
 		},
 		responses: map[string]pluginapi.HTTPResponse{
-			anthropicUsageURL:            {StatusCode: 200, Body: []byte(claudeSample)},
-			codexUsageURL:                {StatusCode: 200, Body: []byte(codexSample)},
-			defaultBaseURL + "/v1/quota": {StatusCode: 200, Body: []byte(neuralwattSample)},
+			anthropicUsageURL + anthropicResetQuery: {StatusCode: 200, Body: []byte(claudeSample)},
+			codexUsageURL:                           {StatusCode: 200, Body: []byte(codexSample)},
+			defaultBaseURL + "/v1/quota":            {StatusCode: 200, Body: []byte(neuralwattSample)},
 		},
 	}
 	m := NewManager(host)
@@ -286,7 +286,7 @@ func TestSummaryEndpoint(t *testing.T) {
 		t.Fatalf("cache miss: %d -> %d", n, len(host.requests))
 	}
 	// Upstream 429 after the cache expires: the last good reading is served, flagged stale.
-	host.responses[anthropicUsageURL] = pluginapi.HTTPResponse{StatusCode: 429}
+	host.responses[anthropicUsageURL+anthropicResetQuery] = pluginapi.HTTPResponse{StatusCode: 429}
 	m.cache.mu.Lock()
 	for k, e := range m.cache.entries {
 		e.lastAt = e.lastAt.Add(-10 * time.Minute)
@@ -319,7 +319,7 @@ func TestPersistedCacheSeedsStaleFallback(t *testing.T) {
 	host := &fakeHost{
 		files:     []pluginapi.HostAuthFileEntry{{AuthIndex: "c1", Provider: "claude", Label: "x", Email: "seat-one@example.com"}},
 		storage:   map[string]string{"c1": `{"type":"claude","access_token":"tok","email":"seat-one@example.com","organization_name":"Inreach"}`},
-		responses: map[string]pluginapi.HTTPResponse{anthropicUsageURL: {StatusCode: 200, Body: []byte(claudeSample)}},
+		responses: map[string]pluginapi.HTTPResponse{anthropicUsageURL + anthropicResetQuery: {StatusCode: 200, Body: []byte(claudeSample)}},
 	}
 	m := NewManager(host)
 	cfgYAML, _ := json.Marshal(map[string]any{"config_yaml": []byte("enabled: true\ncache-file: \"" + cacheFile + "\"\n")})
@@ -334,7 +334,7 @@ func TestPersistedCacheSeedsStaleFallback(t *testing.T) {
 		t.Fatalf("cache file not written: %v", err)
 	}
 	// A fresh manager (restart) with upstream now rate-limited serves the persisted reading as stale.
-	host.responses[anthropicUsageURL] = pluginapi.HTTPResponse{StatusCode: 429}
+	host.responses[anthropicUsageURL+anthropicResetQuery] = pluginapi.HTTPResponse{StatusCode: 429}
 	m2 := NewManager(host)
 	if _, err := m2.HandleCall(pluginabi.MethodPluginRegister, cfgYAML); err != nil {
 		t.Fatal(err)
@@ -344,5 +344,34 @@ func TestPersistedCacheSeedsStaleFallback(t *testing.T) {
 	_ = json.Unmarshal(resp.Body, &s)
 	if len(s.Accounts) != 1 || !s.Accounts[0].Stale || len(s.Accounts[0].Windows) != 2 || s.Accounts[0].Error != "" {
 		t.Fatalf("restart fallback = %+v", s.Accounts)
+	}
+}
+
+const claudeResetsSample = `{"five_hour":{"utilization":25.0,"resets_at":"2026-10-11T15:10:00Z"},
+"limits":[{"kind":"session","group":"session","percent":25,"severity":"normal","resets_at":"2026-10-11T15:10:00Z","is_active":true}],
+"cedar_ember":{"eligible":true,"ineligible_reason":"","at_limit":false,"grants":[
+ {"id":"g1","label":"Launch","resets_total":2,"resets_left":1,"starts_at":"2026-10-01T00:00:00Z","ends_at":"2026-10-20T00:00:00Z"},
+ {"id":"g2","label":"Promo","resets_total":1,"resets_left":0,"starts_at":"2026-10-01T00:00:00Z","ends_at":"2026-10-15T00:00:00Z"},
+ {"id":"g3","label":"Later","resets_total":3,"resets_left":2,"starts_at":"2026-10-01T00:00:00Z","ends_at":"2026-11-30T00:00:00Z"}]}}`
+
+func TestClaudeLimitResets(t *testing.T) {
+	var u claudeUsage
+	if err := json.Unmarshal([]byte(claudeResetsSample), &u); err != nil {
+		t.Fatal(err)
+	}
+	lr := limitResets(u.CedarEmber)
+	if lr == nil || !lr.Eligible || lr.Available != 3 || lr.ExpiresAt != "2026-10-20T00:00:00Z" {
+		t.Fatalf("limit resets = %+v", lr)
+	}
+	var ineligible claudeUsage
+	if err := json.Unmarshal([]byte(`{"cedar_ember":{"eligible":false,"ineligible_reason":"tenure","grants":[]}}`), &ineligible); err != nil {
+		t.Fatal(err)
+	}
+	lr = limitResets(ineligible.CedarEmber)
+	if lr == nil || lr.Eligible || lr.Available != 0 || lr.Reason != "tenure" || lr.ExpiresAt != "" {
+		t.Fatalf("ineligible = %+v", lr)
+	}
+	if limitResets(nil) != nil {
+		t.Fatal("absent block must stay nil")
 	}
 }
